@@ -983,6 +983,7 @@ int main(int argc, char **argv)
 	size_t data_passed[3];
 	size_t total_data;
 	char str[256];
+	int sync_pipefd[3][2];
 
 	struct itimerval itimer;
 	struct sigaction sigact;
@@ -1167,6 +1168,13 @@ int main(int argc, char **argv)
 		if ( pipe(child_pipefd[i])!=0 ) error(errno,"creating pipe for fd %d",i);
 	}
 
+	/* Setup pipes for notifying parent and child before starting timers.
+	   sync_pipefd[1] is used for parent->child notification (parent closes its PIPE_IN to signal).
+	   sync_pipefd[2] is used for child->parent notification (child closes its PIPE_IN to signal). */
+	for(i=1; i<=2; i++) {
+		if ( pipe2(sync_pipefd[i], O_CLOEXEC)!=0 ) error(errno,"creating sync pipe");
+	}
+
 	if ( sigemptyset(&emptymask)!=0 ) error(errno,"creating empty signal mask");
 
 	/* unmask all signals, except SIGCHLD: detected in pselect() below */
@@ -1261,7 +1269,18 @@ int main(int argc, char **argv)
 				error(errno,"closing pipe for fd %d",i);
 			}
 		}
+		if ( close(sync_pipefd[1][PIPE_IN])!=0 || close(sync_pipefd[2][PIPE_OUT])!=0 ) {
+			error(errno,"closing pipe for sync_pipefd");
+		}
 		verbose("pipes closed in child");
+
+		/* block until parent is ready (sync_pipefd[1][PIPE_OUT] closes).
+		   If we read() and get 0 bytes, we know that parent has closed sync_pipefd[1][PIPE_IN].
+		   And it would be unexpected if we get data from the parent before it (show an error). */
+		if ( read(sync_pipefd[1][PIPE_OUT], NULL, 0) != 0 ) {
+			error(errno, "unexpected sync_pipefd read error in child");
+		}
+		/* We don't need to explicitly close sync_pipefd[2]: it will atomically be closed on execve(). */
 
 		/* And execute child command. */
 		execvp(cmdname,cmdargs);
@@ -1277,13 +1296,14 @@ int main(int argc, char **argv)
 			verbose("watchdog using user ID `%d'",getuid());
 		}
 
-		if ( gettimeofday(&starttime,NULL) ) error(errno,"getting time");
-
 		/* Close unused file descriptors */
 		for(i=1; i<=2; i++) {
 			if ( close(child_pipefd[i][PIPE_IN])!=0 ) {
 				error(errno,"closing pipe for fd %i",i);
 			}
+		}
+		if ( close(sync_pipefd[1][PIPE_OUT])!=0 || close(sync_pipefd[2][PIPE_IN])!=0 ) {
+			error(errno,"closing pipe for sync_pipefd");
 		}
 
 		/* Redirect child stdout/stderr to file */
@@ -1340,6 +1360,17 @@ int main(int argc, char **argv)
 			}
 			verbose("setting hard wall-time limit to %.3f seconds",walltimelimit[1]);
 		}
+
+		/* Close PIPE_IN of sync_pipefd[1]: allow child to execve() */
+		if ( close(sync_pipefd[1][PIPE_IN])!=0 ) {
+			error(errno,"closing pipe for sync_pipefd[1] (IN)");
+		}
+		/* Wait before starting timers. Use read() like what is done in child */
+		if ( read(sync_pipefd[2][PIPE_OUT], NULL, 0) != 0 ) {
+			error(errno, "unexpected sync_pipefd read error in parent");
+		}
+
+		if ( gettimeofday(&starttime,NULL) ) error(errno,"getting time");
 
 		if ( times(&startticks)==(clock_t) -1 ) {
 			error(errno,"getting start clock ticks");
